@@ -4,6 +4,7 @@ Features Single-Pass Smoothstep Matrix Inpainting with advanced alignment.
 
 """
 
+import json
 import logging
 import math
 import numpy as np
@@ -185,6 +186,110 @@ def conditioning_has_reference(cond):
     return False
 
 
+# -----------------------------------------------------------------------------
+# Regional prompting (masks + per-mask prompts)
+# -----------------------------------------------------------------------------
+
+def parse_regional_inputs(clip, masks, prompts_json):
+    """Validate the optional regional-prompting inputs.
+
+    Returns (masks_nhw, prompt_list) on success, or (None, None) if regional
+    prompting is disabled or the inputs are malformed (with a logged warning).
+    """
+    if clip is None or masks is None or not prompts_json.strip():
+        if clip is not None or masks is not None or prompts_json.strip():
+            log.warning("[KLEIN] Regional prompting needs clip + masks + prompts_json "
+                        "all connected; one or more missing -> disabled.")
+        return None, None
+
+    try:
+        prompt_list = json.loads(prompts_json)
+    except (json.JSONDecodeError, ValueError) as e:
+        log.warning(f"[KLEIN] prompts_json is not valid JSON ({e}). Regional prompting disabled.")
+        return None, None
+    if not isinstance(prompt_list, list) or not all(isinstance(p, str) for p in prompt_list):
+        log.warning("[KLEIN] prompts_json must be a JSON array of strings, "
+                    "e.g. [\"face detail\", \"fabric texture\"]. Regional prompting disabled.")
+        return None, None
+
+    # Normalize masks to [N, H, W]
+    if masks.ndim == 2:
+        masks = masks.unsqueeze(0)
+    elif masks.ndim == 4:
+        masks = masks[..., 0] if masks.shape[-1] == 1 else masks.squeeze(1)
+    if masks.ndim != 3:
+        log.warning(f"[KLEIN] Unsupported mask shape {tuple(masks.shape)}. Regional prompting disabled.")
+        return None, None
+
+    if len(prompt_list) != masks.shape[0]:
+        log.warning(f"[KLEIN] Mask count ({masks.shape[0]}) != prompt count ({len(prompt_list)}). "
+                    "Regional prompting disabled.")
+        return None, None
+
+    return masks.detach().to("cpu", dtype=torch.float32).clamp(0.0, 1.0), prompt_list
+
+
+def encode_regional_prompts(clip, prompt_list):
+    """Encode each prompt string into a standard ComfyUI conditioning list
+    (same path as the CLIPTextEncode node). Done once, not per tile."""
+    conds = []
+    for prompt_str in prompt_list:
+        tokens = clip.tokenize(str(prompt_str))
+        try:
+            cond = clip.encode_from_tokens_scheduled(tokens)
+        except AttributeError:
+            # Older ComfyUI fallback
+            c, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+            cond = [[c, {"pooled_output": pooled}]]
+        conds.append(cond)
+    return conds
+
+
+def attach_mask_to_conditioning(cond, mask, strength=1.0):
+    """Return a copy of `cond` with an area mask attached to every entry.
+    Mask is [1, h, w] in pixel space; ComfyUI rescales it to latent dims
+    at sampling start (resolve_areas_and_cond_masks)."""
+    out = []
+    for entry in cond:
+        if isinstance(entry, (list, tuple)) and len(entry) == 2 and isinstance(entry[1], dict):
+            d = entry[1].copy()
+            d["mask"] = mask
+            d["mask_strength"] = strength
+            d["set_area_to_bounds"] = False
+            out.append([entry[0], d])
+        else:
+            out.append(entry)
+    return out
+
+
+def build_regional_positive(positive, regional_conds, masks_canvas, crop_region,
+                            min_coverage=0.001):
+    """Build per-tile conditioning from the masks' ownership of this tile.
+
+    Crops each region mask to the tile's actual sampled area (crop_region,
+    i.e. core + padding after 32-px alignment) and attaches it to that
+    region's pre-encoded prompt. Masks with negligible ownership of the tile
+    are dropped (no wasted model evaluations, no cross-tile bleed). The base
+    positive is appended unmasked as the fallback for uncovered areas.
+    """
+    cx1, cy1, cx2, cy2 = crop_region
+    combined = []
+    kept = []
+    for i, cond in enumerate(regional_conds):
+        tile_mask = masks_canvas[i:i + 1, cy1:cy2, cx1:cx2]
+        coverage = float(tile_mask.mean())
+        if coverage < min_coverage:
+            continue
+        combined.extend(attach_mask_to_conditioning(cond, tile_mask))
+        kept.append((i, coverage))
+    if not combined:
+        return positive  # tile owned by no mask -> pure base prompt
+    combined.extend(positive)
+    log.info("[KLEIN] Regional prompts active: "
+             + ", ".join(f"mask {i} ({c:.1%} of tile)" for i, c in kept))
+    return combined
+
+
 def set_guider_conds(guider, positive, negative):
     try:
         guider.set_conds(positive=positive, negative=negative)
@@ -291,6 +396,9 @@ class KleinTiledUpscalerNode:
             },
             "optional": {
                 "upscale_model": ("UPSCALE_MODEL",),
+                "clip":          ("CLIP", {"tooltip": "CLIP encoder for the per-mask prompt strings (regional prompting; use with masks + prompts_json)."}),
+                "masks":         ("MASK", {"tooltip": "Batched masks [N, H, W], one per region, any resolution (regional prompting; use with clip + prompts_json)."}),
+                "prompts_json":  ("STRING", {"default": "", "multiline": True, "tooltip": "JSON array of prompt strings matching the mask batch order, e.g. [\"face detail\", \"fabric texture\"]."}),
             }
         }
 
@@ -302,7 +410,8 @@ class KleinTiledUpscalerNode:
     def upscale(self, guider, positive, negative, sampler, sigmas, vae, image,
                 seed, scale_factor, tiling_strategy, tile_size_mode, tile_width, tile_height, padding,
                 color_match, mask_blur, adaptive_tiling, core_anchor,
-                consistent_noise=True, skip_threshold=0.0, upscale_model=None):
+                consistent_noise=True, skip_threshold=0.0, upscale_model=None,
+                clip=None, masks=None, prompts_json=""):
 
         if upscale_model is not None:
             import comfy_extras.nodes_upscale_model as upscale_nodes
@@ -310,6 +419,13 @@ class KleinTiledUpscalerNode:
         if conditioning_has_reference(positive):
             log.warning("[KLEIN] Incoming positive conditioning already carries reference_latents; "
                         "they will be replaced per-tile with local crops (required for tiling).")
+
+        # --- Regional prompting setup: validate inputs, encode prompts once ---
+        region_masks, prompt_list = parse_regional_inputs(clip, masks, prompts_json)
+        regional_conds = None
+        if region_masks is not None:
+            regional_conds = encode_regional_prompts(clip, prompt_list)
+            log.info(f"[KLEIN] Regional prompting enabled: {len(regional_conds)} mask-prompt pairs")
 
         batch_size = image.shape[0]
         final_batch_outputs = []
@@ -338,6 +454,14 @@ class KleinTiledUpscalerNode:
                 canvas_t = upscaled_t.detach().to("cpu", dtype=torch.float32).clone()
 
                 log.info(f"[KLEIN] Canvas: {canvas_w}x{canvas_h}")
+
+                # Regional prompting: rescale region masks (any input resolution)
+                # to canvas space once, so per-tile crops share tile geometry.
+                masks_canvas = None
+                if regional_conds is not None:
+                    masks_canvas = F.interpolate(
+                        region_masks.unsqueeze(1), size=(canvas_h, canvas_w),
+                        mode='bilinear', align_corners=False).squeeze(1).clamp(0.0, 1.0)
 
                 raw_latent = vae.encode(upscaled_t[:, :, :, :3])
                 latent_divisor = max(1, round(canvas_w / raw_latent.shape[3]))
@@ -511,8 +635,14 @@ class KleinTiledUpscalerNode:
                         log.info(f"[KLEIN] Adaptive denoise factor: {denoise_mult:.2f} "
                                  f"({steps_to_keep}/{actual_total_steps} steps, ratio={var_ratio:.2f})")
 
+                    # Regional prompting: scope prompts to this tile by mask ownership
+                    tile_positive = positive
+                    if masks_canvas is not None:
+                        tile_positive = build_regional_positive(
+                            positive, regional_conds, masks_canvas, crop_region)
+
                     samples = sample_tile(
-                        guider, positive, negative, sampler, tile_sigmas, latent, seed, tile_noise,
+                        guider, tile_positive, negative, sampler, tile_sigmas, latent, seed, tile_noise,
                         raw_latent, crop_region, canvas_w)
 
                     # --- Latent compositing: same smoothstep geometry, latent res ---

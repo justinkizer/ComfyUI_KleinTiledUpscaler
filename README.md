@@ -10,6 +10,7 @@ A highly optimized, self-contained, **inpainting-based** tiling upscale and enha
 ---
 
 ## 📢 News
+* **19.07.26:** Added Regional Prompting via Masks — connect `clip` + `masks` + `prompts_json` to scope prompts to specific image regions, mitigating hallucinations and prompt bleed in tiled upscaling.
 * **13.06.26:** Added new experimental features - `consistent_noise` and `skip_threshold`, would like to hear your feedback, see below for details. Improved seams visibility. Added blending for latent when using latent output. 
 * **07.06.26:** Added optional latent output. Added `core_anchor` feature. Small improvements and bug fixes. 
 * **Initial Release:** Core features deployed including Ground-Truth Laplacian analysis and Adaptive Tiling.
@@ -34,6 +35,57 @@ upscale illustration, subtle texture, natural surface complexity, coherent struc
 * **Avoid:** Complex prompts describing specific objects in one corner to prevent hallucinations in other tiles.
 * **Smooth Skin:** Depending  on the prompt it can increase texture on the skin where it's actually supposed to be smooth. 
 * **Extreme upscale factor:** If pushed too far the model receives too little context to make sense of the tile and how to steer it content.
+
+---
+
+## 🎯 Regional Prompting via Masks
+
+Scope prompts to specific masked regions of the image so that each tile only receives the prompts that actually own part of it. This mitigates the two classic tiled-upscaling failure modes:
+
+| Issue | Without Regional Prompting | With Regional Prompting |
+|-------|---------------------------|------------------------|
+| **Hallucinations** | Empty sky gets random objects rendered because the prompt describes the whole scene | Sky tiles never see unrelated prompts — only the sky mask's prompt (or the base prompt) |
+| **Prompt Bleed** | "Detailed pores on skin" adds pores to clothing, background, everything | The skin prompt is masked to the skin region; other regions use their own prompts or the base prompt |
+
+### How It Works
+
+For each tile processed:
+1. Region masks (any input resolution) are rescaled once to canvas space, then cropped to the tile's actual sampled area (core + padding, after 32-px alignment) — so the regional conditioning is pixel-exact with what the sampler sees.
+2. Masks with negligible ownership of the tile (< 0.1% coverage) are dropped for that tile — no wasted model evaluations, no cross-tile bleed.
+3. Each remaining mask is attached to its pre-encoded prompt conditioning (prompts are CLIP-encoded once upfront, not per tile). ComfyUI rescales the attached masks to latent resolution at sampling start.
+4. The base positive prompt is appended unmasked as the fallback for areas not covered by any mask, and the combined conditioning is passed to the sampler. Per-tile reference latents are applied to all entries as usual.
+
+### New Inputs
+
+| Input | Type | Required | Description |
+|-------|------|----------|-------------|
+| `clip` | CLIP | Optional | CLIP encoder used to encode the per-mask prompt strings. |
+| `masks` | MASK | Optional | Batched masks `[N, H, W]`, one per region, at any resolution (automatically rescaled to canvas size). |
+| `prompts_json` | STRING | Optional | JSON array of prompt strings, one per mask, in mask batch order. Example: `["face detail, sharp eyes", "fabric texture, woven pattern"]` |
+
+**All three must be connected together.** If any is missing or malformed (invalid JSON, prompt count ≠ mask count), regional prompting is disabled with a console warning and the node behaves exactly as before — existing workflows are unaffected.
+
+### Usage Example
+
+```
+CLIP (from Checkpoint/Loader) ─────────► clip
+                                          │
+Mask (face region) ───┐                  │
+                       ▼                  ▼
+                   Mask Batch ──► masks ─ Klein Tiled Upscaler
+                       ▲                  ▲
+Mask (clothing) ──────┘                  │
+                                          │
+prompts_json: ["portrait face, sharp eyes, skin detail",
+               "woven fabric, textile texture, cloth weave"]
+```
+
+### Tips
+
+* **Base prompt:** Always provide a sensible base positive prompt — unmasked areas fall back to it, and it also blends with the regional prompts inside masked areas for global coherence.
+* **Overlapping masks:** Allowed — overlap areas receive combined conditioning from all overlapping prompts.
+* **Keep regional prompts material-focused:** Same rule as the base prompt — describe texture/material, not new objects.
+* **Performance:** Prompts are encoded once upfront; per tile, only the masks that own part of that tile add conditioning entries, so overhead scales with actual mask coverage, not mask count.
 
 ---
 
@@ -72,7 +124,7 @@ All loras for Flux2.Klein should work as expected. Including loras for upscaling
 
 ## 🛑 Limitations & Testing Configuration
 
-* **Prompt Sensitivity:** Highly descriptive or structurally-mismatching prompts can cause stylistic tile drift. Keep prompts focused on the overall material and details of the scene. A basic prompt like `"upscale this image"` works fine, whereas a complex prompt describing specific objects in one corner can cause those objects to hallucinate in other tiles.
+* **Prompt Sensitivity:** Highly descriptive or structurally-mismatching prompts can cause stylistic tile drift. Keep prompts focused on the overall material and details of the scene. A basic prompt like `"upscale this image"` works fine, whereas a complex prompt describing specific objects in one corner can cause those objects to hallucinate in other tiles. **Mitigation:** Use [Regional Prompting via Masks](#-regional-prompting-via-masks) to scope specific prompts to specific regions.
 * **Development Disclaimer:** For development and debugging reasons, the vast majority of tests and calibrations were made with a basic, fast configuration: **4 steps, Euler sampler, CFG 1.0 (Guidance 1.0), 1024 tile size, and 2x upscale**. If you go outside these values (e.g. running 20+ steps, higher CFG/guidance models, or extreme upscales), you may encounter unexpected rendering behaviors, contrast shifts, or alignment quirks that I have not accounted for.
 
 ---
@@ -118,6 +170,7 @@ Restart ComfyUI, and the node will be available in the ComfyUI right-click searc
 
 
 * **`Upscaler model input` :** Optional, runs bicubic without it. 
+* **`clip` / `masks` / `prompts_json` :** Optional, all three together enable [Regional Prompting via Masks](#-regional-prompting-via-masks). `masks` is a batched MASK `[N, H, W]` (any resolution); `prompts_json` is a JSON array of prompt strings in mask batch order, e.g. `["face detail", "fabric texture"]`. If any is missing or invalid, regional prompting is disabled with a console warning and the node behaves as before.
 * **`LATENT output` :** Only ever useful in 2 stage workflow. Tiles latent get blended with nearby tiles.  Don't recommended to use it with `Vae decode/Vae decode tiled` nodes. The node already decodes each tile as the process goes. 
 
 ---
